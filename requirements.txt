@@ -1,7 +1,6 @@
 opencv-python
-deepface
-tf-keras
-icrawler
+numpy
 scikit-learn
 tqdm
 joblib
+icrawler

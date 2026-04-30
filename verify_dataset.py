@@ -1,126 +1,107 @@
-"""Verify cleaned dataset by running DeepFace's built-in race classifier and
-filtering out obvious mismatches (e.g., a white face accidentally scraped
-into data_clean/malay/).
+"""Interactive manual reviewer for data_clean/.
 
-LIMITATION: DeepFace's race classifier only has 6 broad classes -
-  asian, indian, black, white, middle eastern, latino hispanic
-So it CANNOT distinguish Malay vs Chinese (both labeled 'asian'). This
-filter only catches cross-category label noise like westerners, etc.
+The old version used DeepFace's 6-class race classifier as an automatic filter.
+There's no lightweight equivalent without TensorFlow, so this version shows
+each image and lets you decide. Eyeballing a few hundred cropped faces is
+faster than chasing down another ML dep for a 3-class POC.
 
 Usage:
-    python verify_dataset.py                # apply, move rejects to data_rejected/
-    python verify_dataset.py --dry-run      # report only, don't move files
-    python verify_dataset.py --threshold 60 # require >60% confidence to reject
+    python verify_dataset.py                # review all classes
+    python verify_dataset.py --classes malay # one class
 
-Strategy:
-  - malay, chinese folders -> require DeepFace race == "asian" (else reject)
-  - indian folder         -> require DeepFace race == "indian" (else reject)
-  - if DeepFace is <threshold% confident in ANY race, keep (benefit of doubt)
+Controls (inside the window):
+    y / SPACE  -> keep
+    n / d      -> reject (move to data_rejected/<class>/)
+    q          -> stop reviewing this class
+    ESC        -> exit entirely
 """
 
 import argparse
 import shutil
-from collections import Counter
 from pathlib import Path
 
 import cv2
-from deepface import DeepFace
-from tqdm import tqdm
 
 SRC = Path(__file__).parent / "data_clean"
 REJECTED = Path(__file__).parent / "data_rejected"
 
-# Which DeepFace race labels are acceptable for each of our classes.
-EXPECTED = {
-    "malay": {"asian"},
-    "chinese": {"asian"},
-    "indian": {"indian"},
-}
 
+def review_class(cls: str, dry_run: bool) -> tuple[int, int, bool]:
+    cls_dir = SRC / cls
+    rej_dir = REJECTED / cls
+    if not dry_run:
+        rej_dir.mkdir(parents=True, exist_ok=True)
 
-def verify_image(img_path: Path, expected: set, threshold: float) -> tuple[str, str | None]:
-    img = cv2.imread(str(img_path))
-    if img is None:
-        return "error", None
-    try:
-        res = DeepFace.analyze(
-            img_path=img,
-            actions=["race"],
-            detector_backend="skip",
-            enforce_detection=False,
-            silent=True,
-        )
-        res = res[0] if isinstance(res, list) else res
-        race = res.get("dominant_race", "")
-        conf = res.get("race", {}).get(race, 0)
+    files = sorted(cls_dir.glob("*.jpg"))
+    kept = rejected = 0
+    abort_all = False
 
-        if race in expected:
-            return "keep", race
-        if conf < threshold:
-            # DeepFace isn't confident enough to override our label
-            return "keep_uncertain", race
-        return f"reject_{race}", race
-    except Exception:
-        return "error", None
+    for i, f in enumerate(files, 1):
+        img = cv2.imread(str(f))
+        if img is None:
+            continue
+        display = cv2.resize(img, (400, 400))
+        title = f"{cls} {i}/{len(files)}  (y=keep  n=reject  q=next-class  ESC=exit)"
+        cv2.imshow(title, display)
+
+        while True:
+            k = cv2.waitKey(0) & 0xFF
+            if k in (ord('y'), ord(' ')):
+                kept += 1
+                break
+            if k in (ord('n'), ord('d')):
+                rejected += 1
+                if not dry_run:
+                    shutil.move(str(f), str(rej_dir / f.name))
+                break
+            if k == ord('q'):
+                cv2.destroyWindow(title)
+                return kept, rejected, False
+            if k == 27:  # ESC
+                cv2.destroyWindow(title)
+                return kept, rejected, True
+        cv2.destroyWindow(title)
+
+    return kept, rejected, abort_all
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--classes", nargs="+",
+                    help="Subset of classes to review (default: all).")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Only report; don't move files.")
-    ap.add_argument("--threshold", type=float, default=50.0,
-                    help="Min DeepFace confidence to reject an image "
-                         "(default 50 — lower = stricter).")
+                    help="Don't move rejects, just count.")
     args = ap.parse_args()
 
     if not SRC.exists():
         raise SystemExit(f"{SRC} not found. Run clean_dataset.py first.")
 
+    classes = args.classes or sorted(p.name for p in SRC.iterdir() if p.is_dir())
     summary = {}
-    for cls, expected in EXPECTED.items():
-        cls_dir = SRC / cls
-        if not cls_dir.exists():
-            print(f"  {cls}: no folder, skipping")
+
+    for cls in classes:
+        if not (SRC / cls).exists():
+            print(f"  skip {cls}: no folder")
             continue
+        print(f"\nReviewing {cls}...")
+        kept, rejected, abort = review_class(cls, args.dry_run)
+        summary[cls] = (kept, rejected)
+        if abort:
+            print("ESC pressed, stopping.")
+            break
 
-        rej_dir = REJECTED / cls
-        if not args.dry_run:
-            rej_dir.mkdir(parents=True, exist_ok=True)
-
-        files = list(cls_dir.glob("*.jpg"))
-        stats = Counter()
-        race_breakdown = Counter()
-
-        for f in tqdm(files, desc=f"verify {cls}"):
-            result, race = verify_image(f, expected, args.threshold)
-            stats[result] += 1
-            if race:
-                race_breakdown[race] += 1
-            if result.startswith("reject_") and not args.dry_run:
-                shutil.move(str(f), str(rej_dir / f.name))
-
-        total = len(files)
-        kept = stats["keep"] + stats["keep_uncertain"]
-        rejected = sum(v for k, v in stats.items() if k.startswith("reject_"))
-        pct = 100 * rejected / max(total, 1)
-
-        print(f"\n  {cls}: {total} -> kept {kept}, rejected {rejected} ({pct:.1f}%)")
-        print(f"    DeepFace race breakdown: {dict(race_breakdown)}")
-        print(f"    actions: {dict(stats)}")
-        summary[cls] = (total, kept, rejected)
+    cv2.destroyAllWindows()
 
     print("\nSummary:")
-    print(f"  {'class':<10} {'before':>7} {'kept':>6} {'rejected':>9}")
-    for cls, (b, k, r) in summary.items():
-        print(f"  {cls:<10} {b:>7} {k:>6} {r:>9}")
+    print(f"  {'class':<10} {'kept':>6} {'rejected':>9}")
+    for cls, (k, r) in summary.items():
+        print(f"  {cls:<10} {k:>6} {r:>9}")
 
     if args.dry_run:
-        print("\nDRY RUN - no files moved. Rerun without --dry-run to apply.")
+        print("\nDRY RUN - no files moved.")
     else:
-        print(f"\nRejected images -> {REJECTED}/. Eyeball them; if the rejects "
-              f"look legitimately mislabeled, good. If many are actually correct "
-              f"(DeepFace being wrong), rerun with a stricter --threshold.")
-        print("\nThen retrain: python train_ethnicity.py")
+        print(f"\nRejected images -> {REJECTED}/")
+        print("Then retrain: python train_ethnicity.py")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,17 @@
-"""Train a 3-class ethnicity classifier (malay / chinese / indian) on face embeddings.
+"""Train a 3-class ethnicity classifier (malay / chinese / indian) on SFace
+face embeddings.
 
 Pipeline:
-  1. For each image in data_clean/<class>/, run an embedding model -> vector.
+  1. For each image in data_clean/<class>/, run SFace -> 128-d embedding.
   2. Train logistic regression with class-balanced weights.
   3. Report held-out accuracy + confusion matrix.
-  4. Save classifier + label encoder to ethnicity_clf.pkl (auto-detected by
-     face_analyzer.py at runtime).
+  4. Save classifier to ethnicity_clf.pkl.
+
+The pkl is portable: face_analyzer.py auto-loads it on start.
 
 Usage:
-    python train_ethnicity.py                        # default Facenet512
-    python train_ethnicity.py --model ArcFace        # usually +3-5% accuracy
-    python train_ethnicity.py --model VGG-Face       # slower, sometimes better
-    python train_ethnicity.py --c 0.5                # stronger regularization
+    python train_ethnicity.py
+    python train_ethnicity.py --c 0.5        # stronger regularization
 """
 
 import argparse
@@ -19,20 +19,21 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from deepface import DeepFace
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, normalize
+from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
+
+import cv2
+import models
 
 DATA = Path(__file__).parent / "data_clean"
 MODEL_OUT = Path(__file__).parent / "ethnicity_clf.pkl"
+EMBED_NAME = "SFace"
 
-SUPPORTED_MODELS = ["Facenet512", "ArcFace", "VGG-Face", "Facenet", "OpenFace", "SFace"]
 
-
-def extract_embeddings(embed_model: str):
+def extract_embeddings():
     X, y = [], []
     image_files = []
     for class_dir in sorted(p for p in DATA.iterdir() if p.is_dir()):
@@ -41,44 +42,38 @@ def extract_embeddings(embed_model: str):
         for f in files:
             image_files.append((f, class_dir.name))
 
-    for img_path, label in tqdm(image_files, desc=f"embed ({embed_model})"):
+    n_no_face = 0
+    for img_path, label in tqdm(image_files, desc=f"embed ({EMBED_NAME})"):
         try:
-            rep = DeepFace.represent(
-                img_path=str(img_path),
-                model_name=embed_model,
-                detector_backend="skip",  # images are already cropped
-                enforce_detection=False,
-                align=False,
-            )
-            vec = rep[0]["embedding"] if isinstance(rep, list) else rep["embedding"]
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+            vec = models.embed_from_image(img)
+            if vec is None:
+                n_no_face += 1
+                continue
             X.append(vec)
             y.append(label)
         except Exception as e:
             print(f"    skip {img_path.name}: {e}")
 
+    if n_no_face:
+        print(f"  skipped {n_no_face} images where YuNet found no face")
     return np.asarray(X, dtype=np.float32), np.asarray(y)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Facenet512", choices=SUPPORTED_MODELS,
-                    help="Embedding model (default Facenet512). "
-                         "ArcFace usually +3-5%% accuracy but slower.")
     ap.add_argument("--c", type=float, default=1.0,
-                    help="Logistic regression inverse regularization strength "
-                         "(default 1.0; try 0.3-3.0).")
+                    help="LogReg inverse regularization strength (try 0.3-3.0).")
     args = ap.parse_args()
 
     if not DATA.exists():
         raise SystemExit(f"{DATA} does not exist. Run clean_dataset.py first.")
 
-    print(f"Embedding model: {args.model}")
-    print("Extracting embeddings...")
-    X, y = extract_embeddings(args.model)
+    print(f"Embedding model: {EMBED_NAME}")
+    X, y = extract_embeddings()
     print(f"Total samples: {len(X)}  |  feature dim: {X.shape[1]}")
-
-    # L2-normalize embeddings so logistic regression operates on direction, not magnitude
-    X = normalize(X)
 
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
@@ -102,11 +97,11 @@ def main():
     print("Confusion matrix (rows=true, cols=pred):")
     print(confusion_matrix(y_te, y_pred))
 
-    # NB: embed_model is saved in the pkl so face_analyzer.py automatically
-    # uses the matching embedding model at inference time.
-    joblib.dump({"clf": clf, "labels": le.classes_.tolist(), "embed_model": args.model},
-                MODEL_OUT)
-    print(f"\nSaved classifier -> {MODEL_OUT} (embed_model={args.model})")
+    joblib.dump(
+        {"clf": clf, "labels": le.classes_.tolist(), "embed_model": EMBED_NAME},
+        MODEL_OUT,
+    )
+    print(f"\nSaved classifier -> {MODEL_OUT} (embed_model={EMBED_NAME})")
 
 
 if __name__ == "__main__":
