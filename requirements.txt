@@ -1,0 +1,7 @@
+opencv-python
+deepface
+tf-keras
+icrawler
+scikit-learn
+tqdm
+joblib
