@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 import models
 
-SRC = Path(__file__).parent / "data"
+SRC = Path(__file__).parent.parent / "data"
 DST = Path(__file__).parent / "data_clean"
 CROP_SIZE = 224
 MIN_FACE_CONF = 0.8
